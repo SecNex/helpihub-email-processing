@@ -38,7 +38,7 @@ class EmailProcessor:
         return self.conn
 
     def _connect_imap(self):
-        """IMAP-Verbindung mit Fehlerbehandlung"""
+        """IMAP connection with error handling"""
         mail = None
         try:
             if self.mail:
@@ -46,43 +46,47 @@ class EmailProcessor:
                     self.mail.close()
                     self.mail.logout()
                 except:
+                    logger.warning("Failed to properly close existing IMAP connection")
                     pass
                 self.mail = None
-                gc.collect()  # Speicher freigeben
+                gc.collect()
             
+            logger.debug("Establishing new IMAP connection")
             mail = imaplib.IMAP4_SSL(
                 host=self.config['email']['imap_host'],
-                timeout=30  # Timeout hinzufügen
+                timeout=30
             )
             mail.login(self.config['email']['username'], self.config['email']['password'])
+            logger.debug("IMAP connection established successfully")
             return mail
         except Exception as e:
-            logger.error(f"IMAP-Verbindungsfehler: {str(e)}")
+            logger.error(f"IMAP connection error: {str(e)}")
             if mail:
                 try:
                     mail.logout()
                 except:
+                    logger.warning("Failed to logout from IMAP after connection error")
                     pass
                 mail = None
-            gc.collect()  # Speicher freigeben
+            gc.collect()
             raise
 
     def _connect_smtp(self):
-        """SMTP-Verbindung aufbauen"""
+        """Establish SMTP connection"""
         if not self.smtp:
             self.smtp = smtplib.SMTP_SSL(self.config['email']['smtp_host'])
             self.smtp.login(self.config['email']['username'], self.config['email']['password'])
         return self.smtp
 
     def process_emails(self):
-        """E-Mails verarbeiten mit verbessertem Ressourcenmanagement"""
+        """Process emails with improved resource management"""
         mail = None
         try:
+            logger.debug("Starting email processing cycle")
             self.conn = self._connect_db()
             
-            # Mehrere Versuche für IMAP-Verbindung
             max_retries = 3
-            retry_delay = 5  # Sekunden
+            retry_delay = 5  # seconds
             
             for attempt in range(max_retries):
                 try:
@@ -91,7 +95,7 @@ class EmailProcessor:
                 except Exception as e:
                     if attempt == max_retries - 1:
                         raise
-                    logger.warning(f"Verbindungsversuch {attempt + 1} fehlgeschlagen, warte {retry_delay} Sekunden...")
+                    logger.warning(f"Connection attempt {attempt + 1} failed, waiting {retry_delay} seconds...")
                     time.sleep(retry_delay)
                     gc.collect()
             
@@ -99,8 +103,12 @@ class EmailProcessor:
             _, messages = mail.search(None, 'UNSEEN')
             
             if not messages[0]:
-                return  # Keine neuen Nachrichten
-
+                logger.debug("No new messages found")
+                return
+            
+            logger.info(f"Found {len(messages[0].split())} new messages")
+            
+            # Process each email
             for message_number in messages[0].split():
                 try:
                     _, msg_data = mail.fetch(message_number, '(RFC822)')
@@ -110,7 +118,7 @@ class EmailProcessor:
                     try:
                         self._process_single_email(email_message)
                     finally:
-                        # Speicher sofort freigeben
+                        # Free memory immediately
                         del email_message
                         del email_body
                         del msg_data
@@ -120,7 +128,7 @@ class EmailProcessor:
                     logger.error(f"Fehler bei der Verarbeitung einer E-Mail: {str(e)}")
                     continue
         finally:
-            # Verbindungen sauber schließen
+            # Clean up all connections
             if mail:
                 try:
                     mail.close()
@@ -130,7 +138,8 @@ class EmailProcessor:
             gc.collect()
 
     def _cleanup(self):
-        """Verbindungen sauber schließen"""
+        """Clean up all connections"""
+        # Clean up IMAP connection
         if self.mail:
             try:
                 self.mail.close()
@@ -139,6 +148,7 @@ class EmailProcessor:
                 pass
             self.mail = None
 
+        # Clean up SMTP connection
         if self.smtp:
             try:
                 self.smtp.quit()
@@ -146,6 +156,7 @@ class EmailProcessor:
                 pass
             self.smtp = None
 
+        # Clean up database connection
         if self.conn and not self.conn.closed:
             try:
                 self.conn.close()
@@ -157,17 +168,22 @@ class EmailProcessor:
 
     def _process_single_email(self, email_message):
         subject = email_message.get('subject', '')
-        message_id = email_message.get('message-id', '').strip('<>')
         from_addr = parseaddr(email_message.get('from'))[1]
-        to_addr = parseaddr(email_message.get('to'))[1]
         
-        # E-Mail-Referenzen prüfen und loggen
+        # Log email details
+        logger.info(f"Received email - From: {from_addr}, Subject: {subject}")
+        
+        # Extract message-id, to, in-reply-to, and references
+        message_id = email_message.get('message-id', '').strip('<>')
+        to_addr = parseaddr(email_message.get('to'))[1]
         in_reply_to = email_message.get('in-reply-to', '').strip('<>')
         references = email_message.get('references', '').split()
         if references:
             references = [ref.strip('<>') for ref in references]
+
+        logger.debug(f"Processing email details - Message-ID: {message_id}, In-Reply-To: {in_reply_to}")
         
-        # Header-Informationen loggen
+        # Log email details
         logger.info(f"""Verarbeite E-Mail:
             Subject: {subject}
             Message-ID: {message_id}
@@ -177,15 +193,17 @@ class EmailProcessor:
             To: {to_addr}
         """.strip())
         
+        # Process email
         with self.conn.cursor() as cur:
             ticket_id = None
             parent_email_id = None
             
-            # Nach verknüpften E-Mails suchen
+            # Search for linked emails
             if in_reply_to or references:
                 message_refs = [in_reply_to] + (references if references else [])
                 message_refs = [ref for ref in message_refs if ref]
                 
+                # Search for linked emails
                 if message_refs:
                     cur.execute("""
                         SELECT e.ticket_id, e.id, e.message_id
@@ -200,7 +218,7 @@ class EmailProcessor:
                     if result:
                         ticket_id, parent_email_id, parent_message_id = result
         
-            # Wenn keine Thread-Referenz gefunden, nach Ticket-Referenz im Subject suchen
+            # If no thread reference found, search for ticket reference in subject
             if not ticket_id:
                 ticket_reference = self._extract_ticket_reference(subject)
                 if ticket_reference:
@@ -211,7 +229,7 @@ class EmailProcessor:
                     if result:
                         ticket_id = result[0]
             
-            # E-Mail speichern
+            # Store email
             email_id = str(uuid.uuid4())
             cur.execute("""
                 INSERT INTO emails (
@@ -227,7 +245,7 @@ class EmailProcessor:
                 datetime.now(), in_reply_to, references
             ))
 
-            # E-Mail-Thread-Beziehung speichern
+            # Store email thread relationship
             if parent_email_id:
                 cur.execute("""
                     INSERT INTO email_threads (parent_email_id, child_email_id)
@@ -235,23 +253,27 @@ class EmailProcessor:
                     ON CONFLICT DO NOTHING
                 """, (parent_email_id, email_id))
 
-            # Wenn kein Ticket gefunden, neues erstellen
+            # If no ticket found, create new one
             if not ticket_id:
                 ticket_id, ticket_number = self._create_new_ticket(cur, subject, from_addr)
-                # Ticket-ID für die gerade gespeicherte E-Mail aktualisieren
+                # Update ticket ID for the just stored email
                 cur.execute("""
                     UPDATE emails 
                     SET ticket_id = %s 
                     WHERE id = %s
                 """, (ticket_id, email_id))
-                # Bestätigungsmail nur einmal senden
+                # Send confirmation email only once
                 self._send_confirmation_email(from_addr, ticket_number, subject, ticket_id)
 
             self.conn.commit()
 
     def _get_email_body(self, email_message):
+        """Get email body"""
+        # Initialize body   
         body = ""
+        # Check if email is multipart
         if email_message.is_multipart():
+            # Walk through parts of the email
             for part in email_message.walk():
                 if part.get_content_type() == "text/plain":
                     body = part.get_payload(decode=True).decode()
@@ -261,29 +283,31 @@ class EmailProcessor:
         return body
 
     def _extract_ticket_reference(self, subject):
+        """Extract ticket reference from subject"""
         pattern = r'#([A-Z]+-\d+)'
         match = re.search(pattern, subject)
         return match.group(1) if match else None
 
     def _create_new_ticket(self, cur, subject, from_addr):
-        """Neues Ticket erstellen mit verbesserter Ticketnummer-Generierung"""
+        """Create new ticket with improved ticket number generation"""
         max_attempts = 3
         
         for attempt in range(max_attempts):
             try:
-                # Queue basierend auf E-Mail-Adresse bestimmen
+                logger.debug(f"Attempting to create new ticket (attempt {attempt + 1}/{max_attempts})")
+                # Determine queue based on email address
                 cur.execute("SELECT id, prefix FROM queues LIMIT 1")
                 queue_result = cur.fetchone()
                 
                 if not queue_result:
-                    raise ValueError("Keine Queue in der Datenbank gefunden. Mindestens eine Queue muss existieren.")
+                    raise ValueError("No queue found in database. At least one queue must exist.")
                 
                 queue_id, prefix = queue_result
 
-                # Nächste Ticketnummer in einer Transaktion generieren
+                # Generate next ticket number in a transaction
                 cur.execute("BEGIN")
                 
-                # Zuerst die höchste Nummer in einer separaten Abfrage ermitteln
+                # First get the highest number in a separate query
                 cur.execute("""
                     SELECT ticket_number 
                     FROM tickets 
@@ -313,27 +337,29 @@ class EmailProcessor:
                     VALUES (%s, %s, %s, %s, 'New', NULL)
                 """, (ticket_id, ticket_number, str(queue_id), subject))
                 
-                # Supporter zuweisen
+                # Assign supporter
                 self._assign_supporter(cur, ticket_id)
                 
-                # Bestätigungsmail senden
+                # Send confirmation email
                 self._send_confirmation_email(from_addr, ticket_number, subject, ticket_id)
                 
                 cur.execute("COMMIT")
+                logger.info(f"Created new ticket: {ticket_number}")
                 return ticket_id, ticket_number
                 
             except psycopg2.Error as e:
                 cur.execute("ROLLBACK")
                 if attempt == max_attempts - 1:
-                    logger.error(f"Maximale Anzahl von Versuchen ({max_attempts}) erreicht: {str(e)}")
+                    logger.error(f"Maximum attempts ({max_attempts}) reached: {str(e)}")
                     raise
-                logger.warning(f"Versuch {attempt + 1} fehlgeschlagen, versuche erneut...")
-                time.sleep(0.1 * (attempt + 1))  # Exponentielles Backoff
+                logger.warning(f"Attempt {attempt + 1} failed, retrying...")
+                time.sleep(0.1 * (attempt + 1))
         
-        raise RuntimeError("Konnte kein Ticket erstellen nach mehreren Versuchen")
+        raise RuntimeError("Failed to create ticket after multiple attempts")
 
     def _assign_supporter(self, cur, ticket_id):
-        # Hole alle aktiven Supporter
+        """Assign supporter to ticket"""
+        # Get all active supporters
         cur.execute("""
             SELECT id, email 
             FROM supporters 
@@ -361,6 +387,7 @@ class EmailProcessor:
             """, (str(uuid.uuid4()), ticket_id, str(supporter_id)))
 
     def assign_supporter_to_ticket(self, ticket_id, supporter_id):
+        """Assign supporter to ticket"""
         with self.conn.cursor() as cur:
             cur.execute("""
                 UPDATE tickets 
@@ -377,7 +404,7 @@ class EmailProcessor:
         self.conn.commit()
 
     def update_ticket_status(self, ticket_id: str, status_name: str):
-        """Status eines Tickets aktualisieren"""
+        """Update the status of a ticket"""
         with self.conn.cursor() as cur:
             cur.execute("""
                 UPDATE tickets 
@@ -387,13 +414,13 @@ class EmailProcessor:
             self.conn.commit()
 
     def _send_confirmation_email(self, to_address: str, ticket_number: str, subject: str, ticket_id: str):
-        """Bestätigungsmail an den Requester senden und in DB speichern"""
+        """Send confirmation email to requester and store in DB"""
         smtp = None
         try:
             smtp = smtplib.SMTP_SSL(self.config['email']['smtp_host'])
             smtp.login(self.config['email']['username'], self.config['email']['password'])
             
-            # Referenz zur ursprünglichen E-Mail finden
+            # Find reference to original email
             with self.conn.cursor() as cur:
                 cur.execute("""
                     SELECT message_id, in_reply_to, references_list
@@ -407,19 +434,19 @@ class EmailProcessor:
             msg = MIMEMultipart()
             msg['From'] = self.config['email']['username']
             msg['To'] = to_address
-            msg['Subject'] = f'Ticket erstellt: {ticket_number} - {subject}'
+            msg['Subject'] = f'Ticket created: {ticket_number} - {subject}'
             msg['Message-ID'] = f"<{uuid.uuid4()}@{self.config['email']['smtp_host']}>"
             
-            # References und In-Reply-To Header setzen
-            if original_email and original_email[0]:  # Prüfen ob message_id existiert
+            # Set references and In-Reply-To headers
+            if original_email and original_email[0]:  # Check if message_id exists
                 original_message_id = original_email[0]
                 original_in_reply_to = original_email[1]
                 original_references = original_email[2] or []
                 
-                # In-Reply-To ist die Message-ID der ursprünglichen E-Mail
+                # In-Reply-To is the message-id of the original email
                 msg['In-Reply-To'] = f"<{original_message_id}>"
                 
-                # References-Liste aufbauen
+                # Build references list
                 references = []
                 if original_in_reply_to:
                     references.append(original_in_reply_to)
@@ -431,26 +458,26 @@ class EmailProcessor:
                 if references:
                     msg['References'] = ' '.join(f"<{ref}>" for ref in references)
             
-            body = f"""Sehr geehrte/r Anfragende/r,
+            body = f"""Dear/Ms. Requester,
 
-vielen Dank für Ihre Anfrage. Wir haben ein Ticket mit der Nummer {ticket_number} erstellt.
+Thank you for your request. We have created a ticket with the number {ticket_number}.
 
-Betreff: {subject}
+Subject: {subject}
 
-Bitte beziehen Sie sich in weiterer Kommunikation auf diese Ticketnummer, 
-indem Sie #{ticket_number} in der Betreffzeile belassen.
+Please refer to this ticket number in further communication, 
+by leaving #{ticket_number} in the subject line.
 
-Mit freundlichen Grüßen
-Ihr Support-Team"""
+With kind regards
+Your Support Team"""
             
             msg.attach(MIMEText(body.strip(), 'plain'))
             
-            # E-Mail senden
+            # Send email
             smtp.send_message(msg)
             smtp.quit()
             smtp = None
             
-            # Bestätigungsmail in DB speichern
+            # Store confirmation email in DB
             with self.conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO emails (
@@ -468,16 +495,17 @@ Ihr Support-Team"""
                 ))
                 self.conn.commit()
             
-            logger.info(f"Bestätigungsmail für Ticket {ticket_number} an {to_address} gesendet und gespeichert")
+            logger.info(f"Confirmation email sent for ticket {ticket_number} to {to_address}")
             
         except Exception as e:
-            logger.error(f"Fehler beim Senden der Bestätigungsmail: {str(e)}")
+            logger.error(f"Failed to send confirmation email: {str(e)}")
             raise
         finally:
             if smtp:
                 try:
                     smtp.quit()
                 except:
+                    logger.warning("Failed to close SMTP connection properly")
                     pass
 
     def __del__(self):
