@@ -24,7 +24,7 @@ class EmailProcessor:
 
     def _load_config(self):
         config = ConfigParser()
-        config.read('config.ini')
+        config.read('config.development.ini')
         return config
 
     def _connect_db(self):
