@@ -16,6 +16,8 @@ This is a Python script that processes incoming emails and updates the database 
   - `ticket_assignments`
   - `supporters`
 
+You find the database schema in the `sql-models` repository - [sql-models](https://github.com/SecNex/sql-models)
+
 ## Installation
 
 1. Clone the repository
