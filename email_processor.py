@@ -12,7 +12,10 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import gc
 import time
+import os
+import psycopg2.extras
 
+from template import EmailTemplate, TemplateArguments
 logger = logging.getLogger(__name__)
 
 class EmailProcessor:
@@ -24,7 +27,35 @@ class EmailProcessor:
 
     def _load_config(self):
         config = ConfigParser()
-        config.read('config.development.ini')
+        env = os.getenv('ENV', 'development')
+        if os.path.exists(f'config.{env}.ini'):
+            config.read(f'config.{env}.ini')
+        elif os.path.exists('config.ini'):
+            config.read('config.ini')
+        else:
+            self.config = {
+                'company': {
+                    'name': os.getenv('COMPANY_NAME', 'Helpihub'),
+                    'domain': os.getenv('COMPANY_DOMAIN', 'http://localhost:3000')
+                },
+                'database': {
+                    'host': os.getenv('DATABASE_HOST', 'localhost'),
+                    'port': os.getenv('DATABASE_PORT', 5432),
+                    'user': os.getenv('DATABASE_USER', 'postgres'),
+                    'password': os.getenv('DATABASE_PASS', 'postgres'),
+                    'dbname': os.getenv('DATABASE_NAME', 'itsm')
+                },
+                'email': {
+                    'imap_host': os.getenv('EMAIL_IMAP_HOST', None),
+                    'imap_port': os.getenv('EMAIL_IMAP_PORT', None),
+                    'smtp_host': os.getenv('EMAIL_SMTP_HOST', None),
+                    'smtp_port': os.getenv('EMAIL_SMTP_PORT', None),
+                    'username': os.getenv('EMAIL_USERNAME', None),
+                    'password': os.getenv('EMAIL_PASSWORD', None),
+                    'sender_name': os.getenv('EMAIL_SENDER_NAME', 'Helpihub Support'),
+                    'sender_address': os.getenv('EMAIL_SENDER_ADDRESS', None)
+                }
+            }
         return config
 
     def _connect_db(self):
@@ -167,105 +198,84 @@ class EmailProcessor:
         gc.collect()
 
     def _process_single_email(self, email_message):
-        subject = email_message.get('subject', '')
-        from_addr = parseaddr(email_message.get('from'))[1]
-        
-        # Log email details
-        logger.info(f"Received email - From: {from_addr}, Subject: {subject}")
-        
-        # Extract message-id, to, in-reply-to, and references
         message_id = email_message.get('message-id', '').strip('<>')
-        to_addr = parseaddr(email_message.get('to'))[1]
-        in_reply_to = email_message.get('in-reply-to', '').strip('<>')
-        references = email_message.get('references', '').split()
-        if references:
-            references = [ref.strip('<>') for ref in references]
-
-        logger.debug(f"Processing email details - Message-ID: {message_id}, In-Reply-To: {in_reply_to}")
         
-        # Log email details
-        logger.info(f"""Verarbeite E-Mail:
-            Subject: {subject}
-            Message-ID: {message_id}
-            In-Reply-To: {in_reply_to}
-            References: {references if references else 'None'}
-            From: {from_addr}
-            To: {to_addr}
-        """.strip())
-        
-        # Process email
         with self.conn.cursor() as cur:
-            ticket_id = None
-            parent_email_id = None
-            
-            # Search for linked emails
-            if in_reply_to or references:
-                message_refs = [in_reply_to] + (references if references else [])
-                message_refs = [ref for ref in message_refs if ref]
+            try:
+                cur.execute("BEGIN")
                 
-                # Search for linked emails
-                if message_refs:
-                    cur.execute("""
-                        SELECT e.ticket_id, e.id, e.message_id
-                        FROM emails e
-                        WHERE e.message_id = ANY(%s)
-                        ORDER BY 
-                            CASE WHEN e.message_id = %s THEN 0 ELSE 1 END,
-                            e.created_at DESC
-                        LIMIT 1
-                    """, (message_refs, in_reply_to if in_reply_to else ''))
-                    result = cur.fetchone()
-                    if result:
-                        ticket_id, parent_email_id, parent_message_id = result
-        
-            # If no thread reference found, search for ticket reference in subject
-            if not ticket_id:
-                ticket_reference = self._extract_ticket_reference(subject)
-                if ticket_reference:
-                    cur.execute("""
-                        SELECT id FROM tickets WHERE ticket_number = %s
-                    """, (ticket_reference,))
-                    result = cur.fetchone()
-                    if result:
-                        ticket_id = result[0]
-            
-            # Store email
-            email_id = str(uuid.uuid4())
-            cur.execute("""
-                INSERT INTO emails (
-                    id, ticket_id, message_id, from_address, 
-                    to_address, subject, body, received_at,
-                    in_reply_to, references_list
+                # Prüfe ob diese E-Mail bereits verarbeitet wurde
+                cur.execute("""
+                    SELECT id FROM items 
+                    WHERE message_id = %s AND type = 'email'
+                    FOR UPDATE SKIP LOCKED
+                """, (message_id,))
+                
+                if cur.fetchone():
+                    logger.warning(f"Email with message-id {message_id} already processed")
+                    return
+                
+                # Email Details extrahieren
+                subject = email_message.get('subject', '')
+                from_addr = parseaddr(email_message.get('from'))[1]
+                to_addr = parseaddr(email_message.get('to'))[1]
+                in_reply_to = email_message.get('in-reply-to', '').strip('<>')
+                references = email_message.get('references', '').split()
+                if references:
+                    references = [ref.strip('<>') for ref in references]
+
+                # Zuerst Ticket erstellen oder finden
+                ticket_id = None
+                if in_reply_to or references:
+                    # Suche nach verknüpftem Ticket
+                    message_refs = [in_reply_to] + (references if references else [])
+                    message_refs = [ref for ref in message_refs if ref]
+                    
+                    if message_refs:
+                        cur.execute("""
+                            SELECT ticket_id
+                            FROM items
+                            WHERE message_id = ANY(%s)
+                            AND type = 'email'
+                            LIMIT 1
+                        """, (message_refs,))
+                        result = cur.fetchone()
+                        if result:
+                            ticket_id = result[0]
+
+                # Wenn kein existierendes Ticket gefunden, erstelle ein neues
+                if not ticket_id:
+                    ticket_id, ticket_number = self._create_new_ticket(cur, subject, from_addr)
+                
+                # Speichere die ursprüngliche E-Mail
+                email_body = self._get_email_body(email_message)
+                item_id = self._store_email_in_db(
+                    email_message,  # Original-E-Mail
+                    ticket_id,
+                    email_body,
+                    in_reply_to,
+                    references
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-            """, (
-                email_id, ticket_id, message_id, from_addr,
-                to_addr, subject, self._get_email_body(email_message), 
-                datetime.now(), in_reply_to, references
-            ))
+                
+                # Sende Bestätigungsmail nur für neue Tickets
+                if not in_reply_to and not references:
+                    self._send_confirmation_email(
+                        to_address=from_addr,
+                        ticket_number=ticket_number,
+                        subject=subject,
+                        ticket_id=ticket_id,
+                        body=email_body,
+                        original_message_id=message_id  # Übergebe die Original Message-ID
+                    )
 
-            # Store email thread relationship
-            if parent_email_id:
-                cur.execute("""
-                    INSERT INTO email_threads (parent_email_id, child_email_id)
-                    VALUES (%s, %s)
-                    ON CONFLICT DO NOTHING
-                """, (parent_email_id, email_id))
+                cur.execute("COMMIT")
+                logger.info(f"Successfully processed email {message_id} for ticket {ticket_id}")
+                return ticket_id
 
-            # If no ticket found, create new one
-            if not ticket_id:
-                ticket_id, ticket_number = self._create_new_ticket(cur, subject, from_addr)
-                # Update ticket ID for the just stored email
-                cur.execute("""
-                    UPDATE emails 
-                    SET ticket_id = %s 
-                    WHERE id = %s
-                """, (ticket_id, email_id))
-                # Send confirmation email only once
-                self._send_confirmation_email(from_addr, ticket_number, subject, ticket_id)
-
-            self.conn.commit()
+            except Exception as e:
+                cur.execute("ROLLBACK")
+                logger.error(f"Error processing email: {str(e)}")
+                raise
 
     def _get_email_body(self, email_message):
         """Get email body"""
@@ -289,73 +299,50 @@ class EmailProcessor:
         return match.group(1) if match else None
 
     def _create_new_ticket(self, cur, subject, from_addr):
-        """Create new ticket with improved ticket number generation"""
-        max_attempts = 3
+        ticket_id = str(uuid.uuid4())
         
-        for attempt in range(max_attempts):
-            try:
-                logger.debug(f"Attempting to create new ticket (attempt {attempt + 1}/{max_attempts})")
-                # Determine queue based on email address
-                cur.execute("SELECT id, prefix FROM queues LIMIT 1")
-                queue_result = cur.fetchone()
-                
-                if not queue_result:
-                    raise ValueError("No queue found in database. At least one queue must exist.")
-                
-                queue_id, prefix = queue_result
-
-                # Generate next ticket number in a transaction
-                cur.execute("BEGIN")
-                
-                # First get the highest number in a separate query
-                cur.execute("""
-                    SELECT ticket_number 
-                    FROM tickets 
-                    WHERE ticket_number LIKE %s 
-                    ORDER BY 
-                        CAST(SPLIT_PART(ticket_number, '-', 2) AS INTEGER) DESC
-                    LIMIT 1
-                    FOR UPDATE
-                """, (f'{prefix}-%',))
-                
-                result = cur.fetchone()
-                if result:
-                    last_num = int(result[0].split('-')[1])
-                    new_num = last_num + 1
-                else:
-                    new_num = 1
-
-                ticket_number = f"{prefix}-{new_num}"
-                ticket_id = str(uuid.uuid4())
-
-                # Ticket einfügen
-                cur.execute("""
-                    INSERT INTO tickets (
-                        id, ticket_number, queue_id, subject, 
-                        status_name, assigned_supporter_id
-                    )
-                    VALUES (%s, %s, %s, %s, 'New', NULL)
-                """, (ticket_id, ticket_number, str(queue_id), subject))
-                
-                # Assign supporter
-                self._assign_supporter(cur, ticket_id)
-                
-                # Send confirmation email
-                self._send_confirmation_email(from_addr, ticket_number, subject, ticket_id)
-                
-                cur.execute("COMMIT")
-                logger.info(f"Created new ticket: {ticket_number}")
-                return ticket_id, ticket_number
-                
-            except psycopg2.Error as e:
-                cur.execute("ROLLBACK")
-                if attempt == max_attempts - 1:
-                    logger.error(f"Maximum attempts ({max_attempts}) reached: {str(e)}")
-                    raise
-                logger.warning(f"Attempt {attempt + 1} failed, retrying...")
-                time.sleep(0.1 * (attempt + 1))
+        # Hole die nächste Ticket-Nummer
+        cur.execute("SELECT nextval('ticket_number_seq')")
+        ticket_number = cur.fetchone()[0]
         
-        raise RuntimeError("Failed to create ticket after multiple attempts")
+        # Hole die Default Queue
+        cur.execute("""
+            SELECT id FROM queues 
+            WHERE id = '11111111-1111-1111-1111-111111111111'
+            OR name = 'Default Queue'
+            LIMIT 1
+        """)
+        result = cur.fetchone()
+        if not result:
+            # Erstelle Default Queue falls nicht vorhanden
+            queue_id = '11111111-1111-1111-1111-111111111111'
+            cur.execute("""
+                INSERT INTO queues (id, name, prefix, description)
+                VALUES (%s, 'Default Queue', 'SUP', 'Default Support Queue')
+                ON CONFLICT (id) DO NOTHING
+                RETURNING id
+            """, (queue_id,))
+        else:
+            queue_id = result[0]
+        
+        # Erstelle neues Ticket
+        now = datetime.now()
+        cur.execute("""
+            INSERT INTO tickets (
+                id, ticket_number, subject, 
+                queue_id, status_name, created_at, updated_at
+            )
+            VALUES (%s, %s, %s, %s, 'New', %s, %s)
+        """, (
+            ticket_id,
+            f"SUP-{ticket_number:06d}",
+            subject,
+            queue_id,
+            now,  # created_at
+            now   # updated_at
+        ))
+        
+        return ticket_id, f"SUP-{ticket_number:06d}"
 
     def _assign_supporter(self, cur, ticket_id):
         """Assign supporter to ticket"""
@@ -413,100 +400,271 @@ class EmailProcessor:
             """, (status_name, ticket_id))
             self.conn.commit()
 
-    def _send_confirmation_email(self, to_address: str, ticket_number: str, subject: str, ticket_id: str):
-        """Send confirmation email to requester and store in DB"""
+    def _store_email_in_db(self, msg, ticket_id, body, original_email, references):
+        """Speichert eine E-Mail in der Datenbank"""
+        try:
+            with self.conn.cursor() as cur:
+                now = datetime.now()
+                email_id = str(uuid.uuid4())
+                
+                # Wenn msg ein MIMEMultipart-Objekt ist, extrahiere die Header
+                if isinstance(msg, (MIMEMultipart, MIMEText)):
+                    message_id = msg['Message-ID'].strip('<>')
+                    from_addr = msg['From']
+                    to_addr = msg['To']
+                    subject = msg['Subject']
+                    in_reply_to = msg.get('In-Reply-To', '').strip('<>')
+                    # Bestätigungsmails sind immer vom Supporter
+                    source = 'supporter' if 'ticket-confirmation' in str(msg) else 'customer'
+                else:
+                    # Für normale E-Mail-Nachrichten
+                    message_id = msg.get('Message-ID', '').strip('<>')
+                    from_addr = msg.get('From', '')
+                    to_addr = msg.get('To', '')
+                    subject = msg.get('Subject', '')
+                    in_reply_to = msg.get('In-Reply-To', '').strip('<>')
+                    source = 'customer'  # Eingehende E-Mails sind immer vom Kunden
+                
+                # References als JSON vorbereiten
+                refs_json = None
+                if references:
+                    clean_refs = [ref.strip('<>') for ref in references]
+                    refs_json = psycopg2.extras.Json(clean_refs)
+                
+                # E-Mail speichern
+                cur.execute("""
+                    INSERT INTO items (
+                        id, ticket_id, type, message_id, 
+                        from_address, to_address, subject, 
+                        body, received_at, in_reply_to, 
+                        references_list, created_at, created_by_id,
+                        source
+                    )
+                    VALUES (%s, %s, 'email', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                """, (
+                    email_id,
+                    ticket_id,
+                    message_id,
+                    from_addr,
+                    to_addr,
+                    subject,
+                    body,
+                    now,  # received_at
+                    in_reply_to,
+                    refs_json,
+                    now,  # created_at
+                    '22222222-2222-2222-2222-222222222222',  # created_by_id
+                    source  # source ist jetzt korrekt für Bestätigungsmails
+                ))
+                
+                result = cur.fetchone()
+                if not result:
+                    logger.error("Failed to store email in database - no ID returned")
+                    raise Exception("Email storage failed")
+                    
+                logger.info(f"Successfully stored {source} email with ID {email_id} for ticket {ticket_id}")
+                return email_id
+                
+        except Exception as e:
+            logger.error(f"Error storing email in database: {str(e)}")
+            raise
+
+    def _store_comment_in_db(self, ticket_id: str, body: str):
+        """Speichert einen Kommentar in der Datenbank"""
+        try:
+            with self.conn.cursor() as cur:
+                now = datetime.now()
+                comment_id = str(uuid.uuid4())
+                
+                cur.execute("""
+                    INSERT INTO items (
+                        id, ticket_id, type, body, 
+                        received_at, created_at, created_by_id
+                    )
+                    VALUES (%s, %s, 'comment', %s, %s, %s, %s)
+                    RETURNING id
+                """, (
+                    comment_id,
+                    ticket_id,
+                    body,
+                    now,  # received_at
+                    now,  # created_at
+                    '22222222-2222-2222-2222-222222222222'  # created_by_id (System User)
+                ))
+                
+                result = cur.fetchone()
+                if not result:
+                    logger.error("Failed to store comment in database - no ID returned")
+                    raise Exception("Comment storage failed")
+                    
+                logger.info(f"Successfully stored comment with ID {comment_id} for ticket {ticket_id}")
+                
+        except Exception as e:
+            logger.error(f"Error storing comment in database: {str(e)}")
+            raise
+
+    def _send_email(self, msg: MIMEMultipart):
+        """Sendet eine E-Mail via SMTP"""
         smtp = None
         try:
             smtp = smtplib.SMTP_SSL(self.config['email']['smtp_host'])
             smtp.login(self.config['email']['username'], self.config['email']['password'])
-            
-            # Find reference to original email
-            with self.conn.cursor() as cur:
-                cur.execute("""
-                    SELECT message_id, in_reply_to, references_list
-                    FROM emails 
-                    WHERE ticket_id = %s 
-                    ORDER BY created_at DESC  -- Letzte E-Mail zuerst
-                    LIMIT 1
-                """, (ticket_id,))
-                original_email = cur.fetchone()
-                
-            msg = MIMEMultipart()
-            msg['From'] = self.config['email']['username']
-            msg['To'] = to_address
-            msg['Subject'] = f'Ticket created: {ticket_number} - {subject}'
-            msg['Message-ID'] = f"<{uuid.uuid4()}@{self.config['email']['smtp_host']}>"
-            
-            # Set references and In-Reply-To headers
-            if original_email and original_email[0]:  # Check if message_id exists
-                original_message_id = original_email[0]
-                original_in_reply_to = original_email[1]
-                original_references = original_email[2] or []
-                
-                # In-Reply-To is the message-id of the original email
-                msg['In-Reply-To'] = f"<{original_message_id}>"
-                
-                # Build references list
-                references = []
-                if original_in_reply_to:
-                    references.append(original_in_reply_to)
-                if original_references:
-                    references.extend(original_references)
-                if original_message_id:
-                    references.append(original_message_id)
-                
-                if references:
-                    msg['References'] = ' '.join(f"<{ref}>" for ref in references)
-            
-            body = f"""Dear/Ms. Requester,
-
-Thank you for your request. We have created a ticket with the number {ticket_number}.
-
-Subject: {subject}
-
-Please refer to this ticket number in further communication, 
-by leaving #{ticket_number} in the subject line.
-
-With kind regards
-Your Support Team"""
-            
-            msg.attach(MIMEText(body.strip(), 'plain'))
-            
-            # Send email
             smtp.send_message(msg)
-            smtp.quit()
-            smtp = None
-            
-            # Store confirmation email in DB
-            with self.conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO emails (
-                        id, ticket_id, message_id, from_address, 
-                        to_address, subject, body, received_at,
-                        in_reply_to, references_list
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    str(uuid.uuid4()), ticket_id, msg['Message-ID'].strip('<>'),
-                    self.config['email']['username'], to_address,
-                    msg['Subject'], body.strip(), datetime.now(),
-                    original_email[0] if original_email else None,
-                    references if original_email and references else None
-                ))
-                self.conn.commit()
-            
-            logger.info(f"Confirmation email sent for ticket {ticket_number} to {to_address}")
-            
-        except Exception as e:
-            logger.error(f"Failed to send confirmation email: {str(e)}")
-            raise
         finally:
             if smtp:
+                smtp.quit()
+
+    def _create_confirmation_email(self, to_address: str, ticket_number: str, 
+                                 subject: str, body: str, ticket_id: str, original_message_id: str) -> tuple[MIMEMultipart, str]:
+        """Erstellt die Bestätigungs-E-Mail und gibt (msg, body) zurück"""
+        # Original-Email-Daten für Referenzen holen
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT message_id, in_reply_to, references_list
+                FROM items 
+                WHERE message_id = %s 
+                AND type = 'email'
+                ORDER BY created_at ASC
+                LIMIT 1
+            """, (original_message_id,))
+            original_email = cur.fetchone()
+
+        # E-Mail vorbereiten
+        msg = MIMEMultipart()
+        sender_name = self.config['email']['sender_name']
+        sender_address = self.config['email']['sender_address']
+        msg['From'] = f"{sender_name} <{sender_address}>"
+        msg['To'] = to_address
+        msg['Subject'] = f'[{ticket_number}] - {subject}'
+        msg['Message-ID'] = f"<{uuid.uuid4()}@{self.config['email']['smtp_host']}>"
+        
+        # Set references and In-Reply-To headers
+        references = []
+        if original_email and original_email[0]:
+            msg['In-Reply-To'] = f"<{original_email[0]}>"
+            if original_email[2]:  # original references
+                references.extend(original_email[2])
+            if original_email[1]:  # original in-reply-to
+                references.append(original_email[1])
+            references.append(original_email[0])  # original message_id
+            if references:
+                msg['References'] = ' '.join(f"<{ref}>" for ref in references)
+
+        company_image_url = None
+        try:
+            company_image_url = self.config['company']['image_url']
+        except:
+            pass
+        company_name = self.config['company']['name']
+        company_domain = self.config['company']['domain']
+        company = None
+        if company_image_url:
+            company = f'<div class="company"><img src="{company_image_url}" alt="Company Logo" /></div>'
+        else:
+            company = f'<div class="company">{company_name}</div>'
+
+        # Template rendern
+        template = EmailTemplate(
+            template_name="ticket-confirmation",
+            arguments=[
+                TemplateArguments(key="ticket_number", value=ticket_number),
+                TemplateArguments(key="ticket_id", value=ticket_id),
+                TemplateArguments(key="ticket_body", value=body),
+                TemplateArguments(key="sender_name", value=sender_name),
+                TemplateArguments(key="company", value=company),
+                TemplateArguments(key="company_domain", value=company_domain)
+            ]
+        )
+        body = template.render()
+        msg.attach(MIMEText(body.strip(), 'html'))
+        
+        return msg, body, original_email, references
+
+    def _send_confirmation_email(self, to_address: str, ticket_number: str, subject: str, ticket_id: str, body: str, original_message_id: str):
+        """Hauptfunktion für das Senden der Bestätigungs-E-Mail"""
+        try:
+            # E-Mail erstellen
+            msg, body, original_email, references = self._create_confirmation_email(
+                to_address, ticket_number, subject, body, ticket_id, original_message_id
+            )
+
+            # Transaktion starten
+            with self.conn.cursor() as cur:
                 try:
-                    smtp.quit()
-                except:
-                    logger.warning("Failed to close SMTP connection properly")
-                    pass
+                    cur.execute("BEGIN")
+                    
+                    # 1. E-Mail in DB speichern mit source='supporter'
+                    cur.execute("""
+                        INSERT INTO items (
+                            id, ticket_id, type, message_id, 
+                            from_address, to_address, subject, 
+                            body, received_at, in_reply_to, 
+                            references_list, created_at, created_by_id,
+                            source
+                        )
+                        VALUES (%s, %s, 'email', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'supporter')
+                        RETURNING id
+                    """, (
+                        str(uuid.uuid4()),  # id
+                        ticket_id,
+                        msg['Message-ID'].strip('<>'),
+                        msg['From'],
+                        msg['To'],
+                        msg['Subject'],
+                        body,
+                        datetime.now(),  # received_at
+                        msg.get('In-Reply-To', '').strip('<>'),
+                        psycopg2.extras.Json(references) if references else None,
+                        datetime.now(),  # created_at
+                        '22222222-2222-2222-2222-222222222222'  # created_by_id
+                    ))
+                    
+                    item_id = cur.fetchone()[0]
+                    if not item_id:
+                        raise Exception("Failed to store confirmation email")
+                    
+                    # 2. Thread-Beziehung speichern wenn es eine Antwort ist
+                    if original_email and original_email[0]:
+                        # Hole die ID der Original-Email
+                        cur.execute("""
+                            SELECT id 
+                            FROM items 
+                            WHERE message_id = %s 
+                            AND type = 'email'
+                            FOR UPDATE
+                        """, (original_email[0],))
+                        
+                        parent_result = cur.fetchone()
+                        if parent_result:
+                            parent_id = parent_result[0]
+                            # Speichere Thread-Beziehung
+                            cur.execute("""
+                                INSERT INTO item_threads (parent_item_id, child_item_id)
+                                VALUES (%s, %s)
+                            """, (parent_id, item_id))
+                            logger.info(f"Created thread relationship: parent={parent_id}, child={item_id}")
+                        else:
+                            logger.warning(f"Could not find parent email with message_id {original_email[0]}")
+
+                    # 3. E-Mail senden (innerhalb der Transaktion)
+                    try:
+                        self._send_email(msg)
+                    except Exception as e:
+                        logger.error(f"Failed to send email: {str(e)}")
+                        raise
+
+                    cur.execute("COMMIT")
+                    logger.info(f"Successfully processed confirmation email for ticket {ticket_number}")
+                    
+                except Exception as e:
+                    cur.execute("ROLLBACK")
+                    logger.error(f"Transaction failed, rolling back: {str(e)}")
+                    raise
+            
+        except Exception as e:
+            logger.error(f"Failed to send/store confirmation email: {str(e)}")
+            raise
 
     def __del__(self):
         self._cleanup()

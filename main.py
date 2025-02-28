@@ -2,7 +2,7 @@ from email_processor import EmailProcessor
 import time
 import logging
 import gc
-
+import sys
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s: %(message)s',
@@ -12,12 +12,12 @@ logger = logging.getLogger(__name__)
 
 def main():
     processor = None
+    logger.info("Starting email processing...")
     while True:
         try:
             if not processor:
                 processor = EmailProcessor()
             processor.process_emails()
-            logger.info("Email processing completed")
         except ValueError as e:
             logger.error(f"Configuration error: {str(e)}")
             if processor:
@@ -36,4 +36,11 @@ def main():
         time.sleep(10)  # Wait 10 seconds between cycles
 
 if __name__ == "__main__":
-    main() 
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt detected, exiting...")
+        sys.exit(0)
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+        sys.exit(1)

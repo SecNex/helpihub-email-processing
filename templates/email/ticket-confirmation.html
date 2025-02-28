@@ -1,0 +1,139 @@
+<html>
+	<head>
+		<meta
+			name="viewport"
+			content="width=device-width, initial-scale=1.0"
+		/>
+		<meta
+			name="color-scheme"
+			content="light"
+		/>
+		<meta
+			name="supported-color-schemes"
+			content="light"
+		/>
+		<title>Ticket Confirmation</title>
+		<style>
+			:root {
+				color-scheme: light;
+			}
+			body {
+				font-family: Arial, sans-serif;
+				color: #333;
+				margin: 0;
+				padding: 0;
+			}
+			.mail {
+				display: flex;
+				flex-direction: column;
+				align-items: center;
+				padding: 20px;
+			}
+			.mail-container {
+				max-width: 600px;
+				width: 100%;
+				margin: 0 auto;
+				padding: 40px;
+				background-color: #f5f5f5;
+				border-radius: 10px;
+				border: 1px solid #ccc;
+				box-sizing: border-box;
+			}
+
+			/* Mobile Anpassungen */
+			@media screen and (max-width: 480px) {
+				.mail {
+					padding: 0;
+				}
+				.mail-container {
+					max-width: 100%;
+					width: 100%;
+					padding: 20px;
+					border-radius: 0;
+					border-left: none;
+					border-right: none;
+				}
+				.header {
+					font-size: 24px;
+					text-align: left;
+				}
+			}
+
+			.text-area {
+				margin-top: 20px;
+				margin-bottom: 20px;
+			}
+			.text-area-first {
+				margin-top: 0;
+				margin-bottom: 20px;
+			}
+			.text-area-last {
+				margin-top: 20px;
+				margin-bottom: 0;
+			}
+			.header {
+				font-size: 30px;
+				font-weight: bold;
+				margin-bottom: 20px;
+				text-align: center;
+			}
+			.footer {
+				font-size: 10px;
+				color: #666;
+			}
+			.ticket-body {
+				font-family: monospace;
+				font-size: 10px;
+				background-color: #e0e0e0;
+				padding: 10px;
+				border-radius: 5px;
+				border: 1px solid #ccc;
+				white-space: pre-wrap;
+				word-wrap: break-word;
+			}
+			.signature {
+				font-size: 12px;
+				color: #666;
+			}
+			.signature p,
+			.signature i {
+				margin-top: 5px;
+				margin-bottom: 5px;
+			}
+			.company {
+				font-size: 12px;
+				font-weight: 600;
+				margin-bottom: 10px;
+			}
+		</style>
+	</head>
+	<body>
+		<div class="mail">
+			{{ company }}
+			<div class="mail-container">
+				<div class="content">
+					<div class="header">Ticket Confirmation</div>
+					<p class="text-area-first">
+						We have created a ticket for your request with the following number:
+						<strong style="font-weight: bold">{{ ticket_number }}</strong>
+					</p>
+					<p class="text-area ticket-body">{{ ticket_body }}</p>
+					<p class="text-area">
+						You can track the status of your ticket at
+						<a href="{{ company_domain }}/ticket/{{ ticket_id }}"
+							>{{ company_domain }}/ticket/{{ ticket_id }}</a
+						>
+					</p>
+					<p class="text-area">Thank you for your request!</p>
+					<div class="text-area-last signature">
+						<p style="font-weight: bold">Best regards,</p>
+						<i>{{ sender_name }}</i>
+					</div>
+				</div>
+			</div>
+			<div class="footer">
+				<p>This is an automated email. Please do not reply to this email.</p>
+			</div>
+		</div>
+	</body>
+</html>

@@ -1,0 +1,15 @@
+services:
+  db:
+    image: postgres:latest
+    container_name: helpihub-db
+    restart: always
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - 5432:5432
+    volumes:
+      - helpihub-db-data:/var/lib/postgresql/data
+      - ./init.sh:/docker-entrypoint-initdb.d/init.sh
+
+volumes:
+  helpihub-db-data:
