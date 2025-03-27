@@ -5,6 +5,7 @@ import psycopg2
 from datetime import datetime
 import re
 from email.utils import parseaddr
+from email.header import decode_header
 from configparser import ConfigParser
 import logging
 import smtplib
@@ -198,7 +199,7 @@ class EmailProcessor:
         gc.collect()
 
     def _process_single_email(self, email_message):
-        message_id = email_message.get('message-id', '').strip('<>')
+        message_id = email_message.get("message-id", "").strip("<>")
         
         with self.conn.cursor() as cur:
             try:
@@ -215,10 +216,10 @@ class EmailProcessor:
                     logger.warning(f"Email with message-id {message_id} already processed")
                     return
                 
-                # Email Details extrahieren
-                subject = email_message.get('subject', '')
-                from_addr = parseaddr(email_message.get('from'))[1]
-                to_addr = parseaddr(email_message.get('to'))[1]
+                # Email Details extrahieren und dekodieren
+                subject = self._decode_header_string(email_message.get('subject', ''))
+                from_name, from_addr = parseaddr(self._decode_header_string(email_message.get('from', '')))
+                to_name, to_addr = parseaddr(self._decode_header_string(email_message.get('to', '')))
                 in_reply_to = email_message.get('in-reply-to', '').strip('<>')
                 references = email_message.get('references', '').split()
                 if references:
@@ -400,6 +401,17 @@ class EmailProcessor:
             """, (status_name, ticket_id))
             self.conn.commit()
 
+    def _is_html_content(self, msg):
+        """Prüft, ob der E-Mail-Inhalt HTML ist"""
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() == "text/html":
+                    return True
+        else:
+            content_type = msg.get_content_type()
+            return content_type == "text/html"
+        return False
+
     def _store_email_in_db(self, msg, ticket_id, body, original_email, references):
         """Speichert eine E-Mail in der Datenbank"""
         try:
@@ -410,20 +422,24 @@ class EmailProcessor:
                 # Wenn msg ein MIMEMultipart-Objekt ist, extrahiere die Header
                 if isinstance(msg, (MIMEMultipart, MIMEText)):
                     message_id = msg['Message-ID'].strip('<>')
-                    from_addr = msg['From']
-                    to_addr = msg['To']
-                    subject = msg['Subject']
+                    from_addr = self._decode_header_string(msg['From'])
+                    to_addr = self._decode_header_string(msg['To'])
+                    subject = self._decode_header_string(msg['Subject'])
                     in_reply_to = msg.get('In-Reply-To', '').strip('<>')
-                    # Bestätigungsmails sind immer vom Supporter
+                    # Bestätigungsmails sind immer vom Supporter und HTML
                     source = 'supporter' if 'ticket-confirmation' in str(msg) else 'customer'
+                    is_html = True if 'ticket-confirmation' in str(msg) else self._is_html_content(msg)
+                    direction = 'outbound' if 'ticket-confirmation' in str(msg) else 'inbound'
                 else:
                     # Für normale E-Mail-Nachrichten
                     message_id = msg.get('Message-ID', '').strip('<>')
-                    from_addr = msg.get('From', '')
-                    to_addr = msg.get('To', '')
-                    subject = msg.get('Subject', '')
+                    from_addr = self._decode_header_string(msg.get('From', ''))
+                    to_addr = self._decode_header_string(msg.get('To', ''))
+                    subject = self._decode_header_string(msg.get('Subject', ''))
                     in_reply_to = msg.get('In-Reply-To', '').strip('<>')
                     source = 'customer'  # Eingehende E-Mails sind immer vom Kunden
+                    is_html = self._is_html_content(msg)
+                    direction = 'inbound'  # Eingehende E-Mails sind immer inbound
                 
                 # References als JSON vorbereiten
                 refs_json = None
@@ -438,9 +454,9 @@ class EmailProcessor:
                         from_address, to_address, subject, 
                         body, received_at, in_reply_to, 
                         references_list, created_at, created_by_id,
-                        source
+                        source, is_html, direction
                     )
-                    VALUES (%s, %s, 'email', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, 'email', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                 """, (
                     email_id,
@@ -455,7 +471,9 @@ class EmailProcessor:
                     refs_json,
                     now,  # created_at
                     '22222222-2222-2222-2222-222222222222',  # created_by_id
-                    source  # source ist jetzt korrekt für Bestätigungsmails
+                    source,  # source ist jetzt korrekt für Bestätigungsmails
+                    is_html,  # HTML-Status
+                    direction  # Richtung der E-Mail
                 ))
                 
                 result = cur.fetchone()
@@ -532,11 +550,11 @@ class EmailProcessor:
 
         # E-Mail vorbereiten
         msg = MIMEMultipart()
-        sender_name = self.config['email']['sender_name']
+        sender_name = self._decode_header_string(self.config['email']['sender_name'])
         sender_address = self.config['email']['sender_address']
         msg['From'] = f"{sender_name} <{sender_address}>"
-        msg['To'] = to_address
-        msg['Subject'] = f'[{ticket_number}] - {subject}'
+        msg['To'] = self._decode_header_string(to_address)
+        msg['Subject'] = f'[{ticket_number}] - {self._decode_header_string(subject)}'
         msg['Message-ID'] = f"<{uuid.uuid4()}@{self.config['email']['smtp_host']}>"
         
         # Set references and In-Reply-To headers
@@ -601,23 +619,26 @@ class EmailProcessor:
                             from_address, to_address, subject, 
                             body, received_at, in_reply_to, 
                             references_list, created_at, created_by_id,
-                            source
+                            source, is_html, direction
                         )
-                        VALUES (%s, %s, 'email', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'supporter')
+                        VALUES (%s, %s, 'email', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         RETURNING id
                     """, (
                         str(uuid.uuid4()),  # id
                         ticket_id,
                         msg['Message-ID'].strip('<>'),
-                        msg['From'],
-                        msg['To'],
-                        msg['Subject'],
+                        self._decode_header_string(msg['From']),
+                        self._decode_header_string(msg['To']),
+                        self._decode_header_string(msg['Subject']),
                         body,
                         datetime.now(),  # received_at
                         msg.get('In-Reply-To', '').strip('<>'),
                         psycopg2.extras.Json(references) if references else None,
                         datetime.now(),  # created_at
-                        '22222222-2222-2222-2222-222222222222'  # created_by_id
+                        '22222222-2222-2222-2222-222222222222',  # created_by_id
+                        'supporter',
+                        True,  # Bestätigungsmails sind immer HTML
+                        'outbound'  # Bestätigungsmails sind immer outbound
                     ))
                     
                     item_id = cur.fetchone()[0]
@@ -668,4 +689,21 @@ class EmailProcessor:
 
     def __del__(self):
         self._cleanup()
+
+    def _decode_header_string(self, header_string):
+        """Dekodiert einen E-Mail-Header und gibt den dekodierten String zurück"""
+        if not header_string:
+            return ""
+        
+        decoded_parts = []
+        for part, charset in decode_header(header_string):
+            if isinstance(part, bytes):
+                try:
+                    decoded_parts.append(part.decode(charset or 'utf-8', errors='replace'))
+                except (UnicodeDecodeError, LookupError):
+                    decoded_parts.append(part.decode('utf-8', errors='replace'))
+            else:
+                decoded_parts.append(str(part))
+        
+        return ' '.join(decoded_parts)
   

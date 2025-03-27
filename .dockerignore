@@ -1,0 +1,9 @@
+config.ini
+config.development.ini
+README.md
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
